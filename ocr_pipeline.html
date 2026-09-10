@@ -1,0 +1,525 @@
+<div id="app" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 760px; margin: 0 auto; color: #1a1a1a;">
+
+  <div style="margin-bottom: 20px;">
+    <h2 style="font-size: 19px; font-weight: 600; margin: 0 0 4px;">기록일지 OCR 파이프라인</h2>
+    <p style="font-size: 13px; color: #666; margin: 0;">촬영 → 문서 펴기 → OCR 영역 크롭 → Claude 판독 → 저신뢰 행만 재검증</p>
+  </div>
+
+  <div id="stepper" style="display:flex; gap:6px; margin-bottom:24px;">
+    <div class="step-dot" data-step="1">1. 업로드</div>
+    <div class="step-dot" data-step="2">2. 문서 보정</div>
+    <div class="step-dot" data-step="3">3. OCR 영역</div>
+    <div class="step-dot" data-step="4">4. 결과</div>
+  </div>
+
+  <div id="panel-1" class="panel">
+    <div id="dropzone" style="border: 1.5px dashed #ccc; border-radius: 10px; padding: 40px 20px; text-align:center; cursor:pointer; background:#fafafa;">
+      <div style="font-size:14px; color:#555; margin-bottom:8px;">기록일지 사진을 업로드하세요</div>
+      <div style="font-size:12px; color:#999;">클릭하거나 파일을 끌어다 놓기</div>
+      <input type="file" id="file-input" accept="image/*" style="display:none;">
+    </div>
+  </div>
+
+  <div id="panel-2" class="panel" style="display:none;">
+    <p style="font-size:13px; color:#555; margin:0 0 10px;">문서의 네 모서리를 정확히 드래그해서 맞춰주세요.</p>
+    <div style="position:relative; display:inline-block; max-width:100%;">
+      <canvas id="corner-canvas" style="max-width:100%; border-radius:6px; touch-action:none;"></canvas>
+    </div>
+    <div style="margin-top:14px; display:flex; gap:8px;">
+      <button id="reset-corners-btn">모서리 초기화</button>
+      <button id="warp-btn" style="background:#1a1a1a; color:#fff; border-color:#1a1a1a;">문서 펴기 →</button>
+    </div>
+  </div>
+
+  <div id="panel-3" class="panel" style="display:none;">
+    <p style="font-size:13px; color:#555; margin:0 0 10px;">OCR이 필요한 표 영역만 드래그해서 선택하세요.</p>
+    <div style="position:relative; display:inline-block; max-width:100%;">
+      <canvas id="region-canvas" style="max-width:100%; border-radius:6px; touch-action:none; cursor:crosshair;"></canvas>
+    </div>
+    <div style="margin-top:14px; display:flex; gap:8px;">
+      <button id="back-to-warp-btn">← 다시 보정</button>
+      <button id="crop-ocr-btn" style="background:#1a1a1a; color:#fff; border-color:#1a1a1a;">이 영역으로 OCR 실행 →</button>
+    </div>
+  </div>
+
+  <div id="panel-4" class="panel" style="display:none;">
+    <div style="display:flex; gap:16px; align-items:flex-start; margin-bottom:18px;">
+      <img id="ocr-crop-preview" style="width:180px; border-radius:6px; border:0.5px solid #ddd;">
+      <div id="summary-box" style="flex:1;">
+        <div style="font-size:13px; color:#555;">Claude Opus 판독 결과</div>
+        <div id="summary-text" style="font-size:13px; color:#888; margin-top:4px;"></div>
+      </div>
+    </div>
+    <div id="loading-box" style="display:none; font-size:13px; color:#777; padding:20px 0;">Claude가 이미지를 읽는 중입니다...</div>
+    <div id="error-box" style="display:none; font-size:13px; color:#b3261e; background:#fdecea; padding:10px 12px; border-radius:6px; margin-bottom:12px;"></div>
+    <div id="results-table-wrap" style="overflow-x:auto;"></div>
+    <div style="margin-top:16px; display:flex; gap:8px;">
+      <button id="back-to-region-btn">← 영역 다시 선택</button>
+      <button id="reverify-all-btn" style="display:none;">저신뢰 행 전체 재검증</button>
+      <button id="restart-btn">처음부터 새로 시작</button>
+    </div>
+  </div>
+</div>
+
+<style>
+  .step-dot { font-size:12px; color:#aaa; padding:4px 0; border-bottom:2px solid #eee; flex:1; text-align:center; }
+  .step-dot.active { color:#1a1a1a; font-weight:600; border-bottom:2px solid #1a1a1a; }
+  .step-dot.done { color:#555; }
+  button { font-size:13px; padding:8px 14px; border-radius:6px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+  button:hover { background:#f3f3f3; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  table.ocr-table { width:100%; border-collapse:collapse; font-size:13px; }
+  table.ocr-table th, table.ocr-table td { border:0.5px solid #e2e2e2; padding:7px 8px; text-align:left; }
+  table.ocr-table th { background:#f7f7f5; font-weight:600; font-size:12px; color:#555; }
+  tr.low-conf td { background:#fdf3ec; }
+  .conf-pill { font-size:11px; padding:2px 7px; border-radius:10px; display:inline-block; }
+  .conf-high { background:#e7f3ea; color:#2e6b3e; }
+  .conf-low { background:#fbe6d8; color:#a4530f; }
+  .row-reverify-btn { font-size:11px; padding:3px 8px; }
+</style>
+
+<script>
+(function(){
+  const state = {
+    originalImg: null,
+    corners: null,
+    warpedCanvas: null,
+    ocrRegion: null,
+    croppedDataUrl: null,
+    rows: []
+  };
+
+  function setStep(n){
+    document.querySelectorAll('.panel').forEach((p,i)=> p.style.display = (i+1===n) ? '' : 'none');
+    document.querySelectorAll('.step-dot').forEach(d=>{
+      const s = parseInt(d.dataset.step);
+      d.classList.toggle('active', s===n);
+      d.classList.toggle('done', s<n);
+    });
+  }
+
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('file-input');
+  dropzone.addEventListener('click', ()=> fileInput.click());
+  dropzone.addEventListener('dragover', e=>{ e.preventDefault(); dropzone.style.background = '#f0f0f0'; });
+  dropzone.addEventListener('dragleave', ()=> dropzone.style.background = '#fafafa');
+  dropzone.addEventListener('drop', e=>{
+    e.preventDefault();
+    dropzone.style.background = '#fafafa';
+    if (e.dataTransfer.files[0]) loadImage(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', e=>{
+    if (e.target.files[0]) loadImage(e.target.files[0]);
+  });
+
+  function loadImage(file){
+    const reader = new FileReader();
+    reader.onload = ev=>{
+      const img = new Image();
+      img.onload = ()=>{
+        state.originalImg = img;
+        const margin = Math.min(img.width, img.height) * 0.08;
+        state.corners = [
+          {x: margin, y: margin},
+          {x: img.width - margin, y: margin},
+          {x: img.width - margin, y: img.height - margin},
+          {x: margin, y: img.height - margin}
+        ];
+        setupCornerCanvas();
+        setStep(2);
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  let cornerCanvas, cornerCtx, cornerScale = 1;
+  let draggingCorner = -1;
+
+  function setupCornerCanvas(){
+    cornerCanvas = document.getElementById('corner-canvas');
+    cornerCtx = cornerCanvas.getContext('2d');
+    const maxW = 680;
+    cornerScale = Math.min(1, maxW / state.originalImg.width);
+    cornerCanvas.width = state.originalImg.width * cornerScale;
+    cornerCanvas.height = state.originalImg.height * cornerScale;
+    drawCornerCanvas();
+  }
+
+  function drawCornerCanvas(){
+    cornerCtx.clearRect(0,0,cornerCanvas.width,cornerCanvas.height);
+    cornerCtx.drawImage(state.originalImg, 0, 0, cornerCanvas.width, cornerCanvas.height);
+    const pts = state.corners.map(p=>({x:p.x*cornerScale, y:p.y*cornerScale}));
+    cornerCtx.strokeStyle = '#2e8b57';
+    cornerCtx.lineWidth = 2;
+    cornerCtx.beginPath();
+    pts.forEach((p,i)=> i===0 ? cornerCtx.moveTo(p.x,p.y) : cornerCtx.lineTo(p.x,p.y));
+    cornerCtx.closePath();
+    cornerCtx.stroke();
+    pts.forEach(p=>{
+      cornerCtx.fillStyle = '#2e8b57';
+      cornerCtx.beginPath();
+      cornerCtx.arc(p.x, p.y, 9, 0, Math.PI*2);
+      cornerCtx.fill();
+      cornerCtx.strokeStyle = '#fff';
+      cornerCtx.lineWidth = 2;
+      cornerCtx.stroke();
+    });
+  }
+
+  function canvasPos(e, canvas){
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
+  }
+
+  function attachCornerEvents(){
+    const start = e=>{
+      const pos = canvasPos(e, cornerCanvas);
+      let closest = -1, closestDist = Infinity;
+      state.corners.forEach((c,i)=>{
+        const dx = c.x*cornerScale - pos.x, dy = c.y*cornerScale - pos.y;
+        const d = Math.sqrt(dx*dx+dy*dy);
+        if (d < 30 && d < closestDist){ closest = i; closestDist = d; }
+      });
+      draggingCorner = closest;
+    };
+    const move = e=>{
+      if (draggingCorner < 0) return;
+      e.preventDefault();
+      const pos = canvasPos(e, cornerCanvas);
+      state.corners[draggingCorner] = { x: pos.x/cornerScale, y: pos.y/cornerScale };
+      drawCornerCanvas();
+    };
+    const end = ()=> draggingCorner = -1;
+    cornerCanvas.addEventListener('mousedown', start);
+    cornerCanvas.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', end);
+    cornerCanvas.addEventListener('touchstart', start, {passive:false});
+    cornerCanvas.addEventListener('touchmove', move, {passive:false});
+    cornerCanvas.addEventListener('touchend', end);
+  }
+  attachCornerEvents();
+
+  document.getElementById('reset-corners-btn').addEventListener('click', ()=>{
+    const img = state.originalImg;
+    const margin = Math.min(img.width, img.height) * 0.08;
+    state.corners = [
+      {x: margin, y: margin},
+      {x: img.width - margin, y: margin},
+      {x: img.width - margin, y: img.height - margin},
+      {x: margin, y: img.height - margin}
+    ];
+    drawCornerCanvas();
+  });
+
+  function solveHomography(src, dst){
+    const A = [];
+    const b = [];
+    for (let i=0;i<4;i++){
+      const {x:sx,y:sy} = src[i];
+      const {x:dx,y:dy} = dst[i];
+      A.push([sx, sy, 1, 0, 0, 0, -sx*dx, -sy*dx]); b.push(dx);
+      A.push([0, 0, 0, sx, sy, 1, -sx*dy, -sy*dy]); b.push(dy);
+    }
+    for (let col=0; col<8; col++){
+      let pivot = col;
+      for (let r=col+1;r<8;r++) if (Math.abs(A[r][col]) > Math.abs(A[pivot][col])) pivot = r;
+      [A[col],A[pivot]] = [A[pivot],A[col]];
+      [b[col],b[pivot]] = [b[pivot],b[col]];
+      const pv = A[col][col];
+      for (let c=col;c<8;c++) A[col][c] /= pv;
+      b[col] /= pv;
+      for (let r=0;r<8;r++){
+        if (r===col) continue;
+        const factor = A[r][col];
+        for (let c=col;c<8;c++) A[r][c] -= factor * A[col][c];
+        b[r] -= factor * b[col];
+      }
+    }
+    return [b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],1];
+  }
+
+  function warpPerspective(img, srcCorners, outW, outH){
+    const dst = [{x:0,y:0},{x:outW,y:0},{x:outW,y:outH},{x:0,y:outH}];
+    const H = solveHomography(dst, srcCorners);
+    const srcCanvas = document.createElement('canvas');
+    srcCanvas.width = img.width; srcCanvas.height = img.height;
+    srcCanvas.getContext('2d').drawImage(img, 0, 0);
+    const srcData = srcCanvas.getContext('2d').getImageData(0,0,img.width,img.height).data;
+
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = outW; outCanvas.height = outH;
+    const outCtx = outCanvas.getContext('2d');
+    const outImgData = outCtx.createImageData(outW, outH);
+
+    for (let y=0;y<outH;y++){
+      for (let x=0;x<outW;x++){
+        const denom = H[6]*x + H[7]*y + H[8];
+        const sx = (H[0]*x + H[1]*y + H[2]) / denom;
+        const sy = (H[3]*x + H[4]*y + H[5]) / denom;
+        const ix = Math.round(sx), iy = Math.round(sy);
+        const outIdx = (y*outW+x)*4;
+        if (ix>=0 && ix<img.width && iy>=0 && iy<img.height){
+          const srcIdx = (iy*img.width+ix)*4;
+          outImgData.data[outIdx] = srcData[srcIdx];
+          outImgData.data[outIdx+1] = srcData[srcIdx+1];
+          outImgData.data[outIdx+2] = srcData[srcIdx+2];
+          outImgData.data[outIdx+3] = 255;
+        } else {
+          outImgData.data[outIdx+3] = 0;
+        }
+      }
+    }
+    outCtx.putImageData(outImgData, 0, 0);
+    return outCanvas;
+  }
+
+  document.getElementById('warp-btn').addEventListener('click', ()=>{
+    const c = state.corners;
+    const widthTop = Math.hypot(c[1].x-c[0].x, c[1].y-c[0].y);
+    const widthBottom = Math.hypot(c[2].x-c[3].x, c[2].y-c[3].y);
+    const heightLeft = Math.hypot(c[3].x-c[0].x, c[3].y-c[0].y);
+    const heightRight = Math.hypot(c[2].x-c[1].x, c[2].y-c[1].y);
+    const outW = Math.round(Math.max(widthTop, widthBottom));
+    const outH = Math.round(Math.max(heightLeft, heightRight));
+    state.warpedCanvas = warpPerspective(state.originalImg, c, outW, outH);
+    setupRegionCanvas();
+    setStep(3);
+  });
+
+  let regionCanvas, regionCtx, regionScale = 1;
+  let dragStart = null, dragCurrent = null;
+
+  function setupRegionCanvas(){
+    regionCanvas = document.getElementById('region-canvas');
+    regionCtx = regionCanvas.getContext('2d');
+    const maxW = 680;
+    regionScale = Math.min(1, maxW / state.warpedCanvas.width);
+    regionCanvas.width = state.warpedCanvas.width * regionScale;
+    regionCanvas.height = state.warpedCanvas.height * regionScale;
+    state.ocrRegion = null;
+    drawRegionCanvas();
+  }
+
+  function drawRegionCanvas(){
+    regionCtx.clearRect(0,0,regionCanvas.width,regionCanvas.height);
+    regionCtx.drawImage(state.warpedCanvas, 0, 0, regionCanvas.width, regionCanvas.height);
+    if (dragStart && dragCurrent){
+      const x = Math.min(dragStart.x, dragCurrent.x), y = Math.min(dragStart.y, dragCurrent.y);
+      const w = Math.abs(dragCurrent.x - dragStart.x), h = Math.abs(dragCurrent.y - dragStart.y);
+      regionCtx.strokeStyle = '#c0562e';
+      regionCtx.lineWidth = 2;
+      regionCtx.setLineDash([6,4]);
+      regionCtx.strokeRect(x,y,w,h);
+      regionCtx.fillStyle = 'rgba(192,86,46,0.08)';
+      regionCtx.fillRect(x,y,w,h);
+      regionCtx.setLineDash([]);
+    }
+  }
+
+  regionCanvas = null;
+  function attachRegionEvents(){
+    const canvas = document.getElementById('region-canvas');
+    const start = e=>{ dragStart = canvasPos(e, canvas); dragCurrent = dragStart; drawRegionCanvas(); };
+    const move = e=>{
+      if (!dragStart) return;
+      e.preventDefault();
+      dragCurrent = canvasPos(e, canvas);
+      drawRegionCanvas();
+    };
+    const end = ()=>{
+      if (dragStart && dragCurrent){
+        const x = Math.min(dragStart.x, dragCurrent.x) / regionScale;
+        const y = Math.min(dragStart.y, dragCurrent.y) / regionScale;
+        const w = Math.abs(dragCurrent.x - dragStart.x) / regionScale;
+        const h = Math.abs(dragCurrent.y - dragStart.y) / regionScale;
+        if (w > 10 && h > 10) state.ocrRegion = {x,y,w,h};
+      }
+      dragStart = null;
+    };
+    canvas.addEventListener('mousedown', start);
+    canvas.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', end);
+    canvas.addEventListener('touchstart', start, {passive:false});
+    canvas.addEventListener('touchmove', move, {passive:false});
+    canvas.addEventListener('touchend', end);
+  }
+
+  const observer = new MutationObserver(()=>{
+    const c = document.getElementById('region-canvas');
+    if (c && c !== regionCanvas){ regionCanvas = c; attachRegionEvents(); }
+  });
+  observer.observe(document.getElementById('panel-3'), {childList:true, subtree:true});
+  setTimeout(()=>{ if(document.getElementById('region-canvas')) attachRegionEvents(); }, 0);
+
+  document.getElementById('back-to-warp-btn').addEventListener('click', ()=> setStep(2));
+  document.getElementById('back-to-region-btn').addEventListener('click', ()=> setStep(3));
+  document.getElementById('restart-btn').addEventListener('click', ()=>{
+    state.rows = [];
+    document.getElementById('results-table-wrap').innerHTML = '';
+    document.getElementById('summary-text').textContent = '';
+    setStep(1);
+  });
+
+  function cropToDataUrl(sourceCanvas, region){
+    const c = document.createElement('canvas');
+    c.width = Math.round(region.w); c.height = Math.round(region.h);
+    c.getContext('2d').drawImage(sourceCanvas, region.x, region.y, region.w, region.h, 0, 0, region.w, region.h);
+    return { canvas: c, dataUrl: c.toDataURL('image/jpeg', 0.92) };
+  }
+
+  document.getElementById('crop-ocr-btn').addEventListener('click', async ()=>{
+    if (!state.ocrRegion){
+      alert('먼저 OCR 영역을 드래그해서 선택해주세요.');
+      return;
+    }
+    const cropped = cropToDataUrl(state.warpedCanvas, state.ocrRegion);
+    state.croppedDataUrl = cropped.dataUrl;
+    document.getElementById('ocr-crop-preview').src = cropped.dataUrl;
+    setStep(4);
+    await runOcr(cropped.dataUrl);
+  });
+
+  function base64Body(dataUrl){ return dataUrl.split(',')[1]; }
+
+  async function callClaudeVision(base64Image, promptText){
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1500,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64Image } },
+            { type: "text", text: promptText }
+          ]
+        }]
+      })
+    });
+    const data = await response.json();
+    const textBlocks = (data.content || []).filter(b=>b.type==='text').map(b=>b.text);
+    return textBlocks.join('\n');
+  }
+
+  function parseJsonLoose(text){
+    const cleaned = text.replace(/```json/g,'').replace(/```/g,'').trim();
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    return JSON.parse(cleaned.slice(start, end+1));
+  }
+
+  const OCR_PROMPT = `이 이미지는 입출고 기록일지 표입니다. 인쇄된 고객번호/고객명과 손글씨로 적힌 배송분/회수분 숫자를 함께 읽어주세요.
+표의 각 행(row)에 대해 아래 JSON 형식으로만, 다른 설명 없이 응답하세요:
+{
+  "rows": [
+    {
+      "customer_id": "고객번호",
+      "customer_name": "고객명",
+      "delivery_qty": "배송분 숫자",
+      "return_qty": "회수분 숫자",
+      "confidence": "high 또는 low (손글씨가 불명확하면 low)",
+      "bbox": {"x":0~1, "y":0~1, "w":0~1, "h":0~1}
+    }
+  ]
+}
+bbox는 이 이미지 내에서 해당 행이 차지하는 위치를 0~1 사이 비율로 표시하세요. 읽을 수 없는 값은 빈 문자열로 두고 confidence를 low로 표시하세요.`;
+
+  async function runOcr(dataUrl){
+    document.getElementById('loading-box').style.display = '';
+    document.getElementById('error-box').style.display = 'none';
+    document.getElementById('results-table-wrap').innerHTML = '';
+    document.getElementById('summary-text').textContent = '';
+    try {
+      const text = await callClaudeVision(base64Body(dataUrl), OCR_PROMPT);
+      const parsed = parseJsonLoose(text);
+      state.rows = (parsed.rows || []).map(r=>({...r, reverified:false}));
+      renderResults();
+    } catch(err){
+      document.getElementById('error-box').style.display = '';
+      document.getElementById('error-box').textContent = '판독 중 오류가 발생했습니다: ' + err.message;
+    } finally {
+      document.getElementById('loading-box').style.display = 'none';
+    }
+  }
+
+  function renderResults(){
+    const total = state.rows.length;
+    const lowCount = state.rows.filter(r=>r.confidence==='low').length;
+    document.getElementById('summary-text').textContent =
+      total + '개 행 판독 완료 · 정상 ' + (total-lowCount) + '개 · 저신뢰 ' + lowCount + '개';
+
+    const reBtn = document.getElementById('reverify-all-btn');
+    reBtn.style.display = lowCount > 0 ? '' : 'none';
+
+    let html = '<table class="ocr-table"><thead><tr>' +
+      '<th>고객번호</th><th>고객명</th><th>배송분</th><th>회수분</th><th>신뢰도</th><th></th>' +
+      '</tr></thead><tbody>';
+    state.rows.forEach((r, i)=>{
+      const low = r.confidence === 'low';
+      html += '<tr class="' + (low ? 'low-conf' : '') + '">' +
+        '<td>' + escapeHtml(r.customer_id||'') + '</td>' +
+        '<td>' + escapeHtml(r.customer_name||'') + '</td>' +
+        '<td>' + escapeHtml(r.delivery_qty||'') + '</td>' +
+        '<td>' + escapeHtml(r.return_qty||'') + '</td>' +
+        '<td><span class="conf-pill ' + (low?'conf-low':'conf-high') + '">' + (low?'저신뢰':'정상') + '</span></td>' +
+        '<td>' + (low ? '<button class="row-reverify-btn" data-idx="'+i+'">재검증</button>' : '') + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('results-table-wrap').innerHTML = html;
+
+    document.querySelectorAll('.row-reverify-btn').forEach(btn=>{
+      btn.addEventListener('click', ()=> reverifyRow(parseInt(btn.dataset.idx)));
+    });
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function reverifyRow(idx){
+    const row = state.rows[idx];
+    if (!row.bbox) return;
+    const cropCanvas = document.createElement('canvas');
+    const srcCanvas = new Image();
+    srcCanvas.src = state.croppedDataUrl;
+    await new Promise(res=> srcCanvas.onload = res);
+    const pad = 0.03;
+    const x = Math.max(0, row.bbox.x - pad) * srcCanvas.width;
+    const y = Math.max(0, row.bbox.y - pad) * srcCanvas.height;
+    const w = Math.min(1, row.bbox.w + pad*2) * srcCanvas.width;
+    const h = Math.min(1, row.bbox.h + pad*2) * srcCanvas.height;
+    cropCanvas.width = w; cropCanvas.height = h;
+    cropCanvas.getContext('2d').drawImage(srcCanvas, x, y, w, h, 0, 0, w, h);
+    const rowDataUrl = cropCanvas.toDataURL('image/jpeg', 0.95);
+
+    const btn = document.querySelector('.row-reverify-btn[data-idx="'+idx+'"]');
+    if (btn){ btn.disabled = true; btn.textContent = '확인 중...'; }
+
+    const prompt = `이 이미지는 입출고 기록일지의 한 행을 확대한 것입니다. 인쇄된 고객번호/고객명과 손글씨로 적힌 배송분/회수분 숫자를 최대한 정확히 읽어 아래 JSON으로만 응답하세요:
+{"customer_id":"", "customer_name":"", "delivery_qty":"", "return_qty":"", "confidence":"high 또는 low"}`;
+    try {
+      const text = await callClaudeVision(base64Body(rowDataUrl), prompt);
+      const parsed = parseJsonLoose(text);
+      state.rows[idx] = { ...row, ...parsed, reverified: true };
+      renderResults();
+    } catch(err){
+      if (btn){ btn.disabled = false; btn.textContent = '재검증'; }
+      alert('재검증 실패: ' + err.message);
+    }
+  }
+
+  document.getElementById('reverify-all-btn').addEventListener('click', async ()=>{
+    const idxs = state.rows.map((r,i)=> r.confidence==='low' ? i : -1).filter(i=>i>=0);
+    for (const i of idxs) await reverifyRow(i);
+  });
+
+  setStep(1);
+})();
+</script>
